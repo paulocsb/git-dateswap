@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+
+set -e
+
+# === Configuration ===
+SCRIPT_NAME="git-dateswap"
+SETTINGS_FILE="$HOME/.${SCRIPT_NAME}-settings"
+
+# === Functions ===
+error_exit() {
+  echo "[error] $1" >&2
+  exit 1
+}
+
+check_dependency() {
+  command -v "$1" > /dev/null 2>&1 || {
+    echo "[missing] $1 not found."
+    case "$(uname -s)" in
+      Darwin)
+        echo "  Install it using: brew install $2";;
+      Linux)
+        if [[ -f /etc/debian_version ]]; then
+          echo "  Install it using: sudo apt install $2"
+        elif [[ -f /etc/arch-release ]]; then
+          echo "  Install it using: sudo pacman -S $2"
+        else
+          echo "  Please install $2 via your package manager."
+        fi;;
+      *)
+        echo "  Please install $2 manually."
+    esac
+    exit 1
+  }
+}
+
+choose_editor() {
+  if [[ "$USE_GUM" -eq 1 ]]; then
+    editor=$(gum choose vi nano code micro emacs other)
+    if [[ "$editor" == "other" ]]; then
+      editor=$(gum input --placeholder "Full path to editor:")
+    fi
+  else
+    echo "Choose your preferred text editor to edit commit dates:"
+    echo "1. vi"
+    echo "2. nano"
+    echo "3. Other (specify path)"
+    read -rp "Select [1/2/3]: " choice
+    case "$choice" in
+      1) editor="vi" ;;
+      2) editor="nano" ;;
+      3) read -rp "Full path to editor: " editor ;;
+      *) editor="vi" ;;
+    esac
+  fi
+  echo "editor: $editor"
+  echo "$editor" > "$SETTINGS_FILE"
+}
+
+get_editor() {
+  if [[ -f "$SETTINGS_FILE" ]] && [[ -n $(<"$SETTINGS_FILE") ]] && [[ "$TUI" -eq 0 ]]; then
+    editor=$(<"$SETTINGS_FILE")
+  elif [[ -n "$EDITOR" ]] && [[ "$TUI" -eq 0 ]]; then
+    editor="$EDITOR"
+  else
+    choose_editor
+  fi
+}
+
+print_help() {
+  cat <<EOF
+$SCRIPT_NAME - Edit commit dates interactively using git-filter-repo
+
+Usage: $SCRIPT_NAME [--all] [--commits N] [--debug] [--editor PATH] [--tui] [--help]
+
+Options:
+  -a, --all           Edit all commits
+  -c, --commits N     Edit the last N commits (default: 5)
+  -d, --debug         Print generated Python callback
+  -e, --editor PATH   Use specified editor
+  -t, --tui           Use gum-based TUI interface (requires 'gum')
+  -h, --help          Show this help message
+  --no-restore-remote Do not restore the 'origin' remote after 'git-filter-repo' runs
+
+Dependencies:
+  - git
+  - git-filter-repo
+EOF
+}
+
+# === Parse arguments ===
+ALL=0
+DEBUG=0
+COMMITS=5
+USE_GUM=0
+RESTORE_REMOTE=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--all) ALL=1 ;;
+    -c|--commits)
+      COMMITS="$2"
+      shift ;;
+    -d|--debug) DEBUG=1 ;;
+    -e|--editor)
+      editor="$2"
+      shift
+      echo "$editor" > "$SETTINGS_FILE" ;;
+    -t|--tui) TUI=1 ;;
+    --no-restore-remote) RESTORE_REMOTE=0 ;;
+    -h|--help)
+      print_help
+      exit 0 ;;
+    *) echo "Unknown option: $1"; print_help; exit 1 ;;
+  esac
+  shift
+
+done
+
+# === Optional gum support ===
+if command -v gum > /dev/null; then
+  USE_GUM=1
+elif [[ $TUI -eq 1 ]]; then
+  echo "❌ [-t|--tui] flag requires 'gum' to be installed." >&2
+  case "$(uname)" in
+    Darwin) echo "Install it with: brew install gum" ;;
+    Linux) echo "Install it with: sudo snap install gum or see: https://github.com/charmbracelet/gum" ;;
+    *) echo "Please install gum from https://github.com/charmbracelet/gum" ;;
+  esac
+  exit 1
+fi
+
+# === Dependency checks ===
+check_dependency git git
+check_dependency git-filter-repo git-filter-repo
+
+# === Git repo check ===
+git rev-parse --show-toplevel > /dev/null 2>&1 || error_exit "Not a git repository."
+
+get_editor
+
+# === Generate commit list ===
+TMPFILE=$(mktemp /tmp/git-dateswap-list.XXXXXX)
+trap 'rm -f "$TMPFILE"' EXIT
+
+DATE_FMT="%cI"
+if [[ "$(git log -1 --pretty=format:"$DATE_FMT")" == "$DATE_FMT" ]]; then
+  DATE_FMT="%ci"
+fi
+
+if [[ $ALL -eq 1 ]]; then
+  git log --pretty=format:"$DATE_FMT | %H | %s" > "$TMPFILE"
+else
+  git log -n "$COMMITS" --pretty=format:"$DATE_FMT | %H | %s" > "$TMPFILE"
+fi
+
+"$editor" "$TMPFILE"
+
+# === Create Python callback ===
+CALLBACK_SCRIPT=$(mktemp /tmp/git-dateswap-callback.XXXXXX.py)
+trap 'rm -f "$CALLBACK_SCRIPT" "$TMPFILE"' EXIT
+
+{
+  echo "import datetime"
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    DATE=$(echo "$line" | cut -d'|' -f1 | xargs)
+    HASH=$(echo "$line" | cut -d'|' -f2 | xargs)
+    [[ "$DATE" == "now" ]] && DATE=$(date +%Y-%m-%dT%H:%M:%S%z)
+    echo "dt = datetime.datetime.fromisoformat(\"$DATE\")"
+    echo "timestamp = int(dt.timestamp())"
+    echo "timezone = dt.strftime(\"%z\")"
+    echo "git_date = f\"{timestamp} {timezone}\""
+    echo "if commit.original_id == b'$HASH':"
+    echo "  commit.committer_date = git_date.encode()"
+    echo "  commit.author_date = git_date.encode()"
+  done < "$TMPFILE"
+} > "$CALLBACK_SCRIPT"
+
+[[ $DEBUG -eq 1 ]] && {
+  echo "[debug] Python callback script:" >&2
+  cat "$CALLBACK_SCRIPT" >&2
+}
+
+# save remote
+REMOTE_URL=$(git remote get-url origin 2>/dev/null)
+
+echo "[info] Applying changes with git-filter-repo..."
+git filter-repo --force --commit-callback "$CALLBACK_SCRIPT" 2>&1 | tee debug.log
+
+# re-add remote
+if [[ $RESTORE_REMOTE -eq 1 && -n "$REMOTE_URL" ]]; then
+  git remote add origin "$REMOTE_URL"
+  echo "[info] Remote origin restored to: $REMOTE_URL"
+else
+  echo "[info] Remote not restored (by user request or not found)."
+fi
+
+echo "✅ Commit dates updated successfully."
+echo "💡 Don't forget to: git push --force"
