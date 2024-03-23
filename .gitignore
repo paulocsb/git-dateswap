@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Linux/macOS temp files
+*.swp
+*.swo
+*.swn
+*~
+
+# Logs
+debug.log
+
+# Python temp
+__pycache__/
+*.pyc
+
+# Shell temp
+*.bak
+*.tmp
+*.log
+
+# OS temp
+tmp/
